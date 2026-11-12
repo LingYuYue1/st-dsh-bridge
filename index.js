@@ -378,12 +378,9 @@ function buildPanel() {
     host.appendChild(root);
     panelEl = root;
 
-    try {
-        globalThis.jQuery?.(root).find('.inline-drawer-toggle').on('click', () => {
-            globalThis.jQuery?.(root).find('.inline-drawer-content').slideToggle(200);
-            globalThis.jQuery?.(root).find('.inline-drawer-icon').toggleClass('down up');
-        });
-    } catch { /* ignore */ }
+    // 折叠交给酒馆自己处理：它对 `.inline-drawer-toggle` 有全局事件委托
+    // （script.js 里 `$(document).on('click', '.inline-drawer-toggle', …)`）。
+    // 这里再绑一次会导致「展开后立刻收起」——两个 handler 同时 toggle。
 
     renderStatus();
 }
