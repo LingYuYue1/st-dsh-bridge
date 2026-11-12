@@ -1,0 +1,11 @@
+{
+    "display_name": "DSH 桥接",
+    "loading_order": 90,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "Ling",
+    "version": "0.1.0",
+    "homePage": "https://github.com/LingYuYue1/st-dsh-bridge"
+}
