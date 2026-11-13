@@ -77,22 +77,86 @@ function saveSettings() {
 
 /* ------------------------------ 数据采集 ------------------------------ */
 
-/** MVU 变量：拿不到就返回 null，不抛错。 */
+/**
+ * MVU 变量：拿不到就返回 null，不抛错。
+ *
+ * 🔴 坑：MVU（MagVarUpdate / 酒馆助手）是用 `Object.defineProperty` 挂到 window 的，
+ * 而且可能比本扩展晚加载。所以不能只查一次 `globalThis.Mvu`——要：
+ *   1. 多重入口（Mvu / TavernHelper / 酒馆助手的 getVariables）
+ *   2. 每次都重新取（不缓存 API 引用）
+ *   3. 拿不到时给出「为什么拿不到」的线索，方便排查
+ */
 function readMvu() {
+    const tried = [];
+
+    // 入口 1：Mvu 官方（MagVarUpdate / 酒馆助手导出）
     try {
         const api = globalThis.Mvu;
-        if (!api || typeof api.getMvuData !== 'function') return null;
-        for (const options of [{ type: 'chat' }, { type: 'message', message_id: 'latest' }]) {
+        if (!api || typeof api.getMvuData !== 'function') {
+            tried.push('Mvu: ' + (api ? '没有 getMvuData' : '未加载'));
+        } else {
+            // 依次试 chat → message(latest) → 显式楼层
+            const attempts = [
+                { type: 'chat' },
+                { type: 'message', message_id: 'latest' },
+            ];
+            // 补一个「当前楼层号」，有些版本只认数字
             try {
-                const data = api.getMvuData(options);
-                const stat = data?.stat_data;
-                if (stat && typeof stat === 'object' && Object.keys(stat).length) {
-                    return { source: options.type, data: stat };
+                const c = ctx();
+                const id = Array.isArray(c?.chat) ? c.chat.length - 1 : -1;
+                if (id >= 0) attempts.push({ type: 'message', message_id: id });
+            } catch { /* ignore */ }
+
+            for (const options of attempts) {
+                try {
+                    const data = api.getMvuData(options);
+                    const stat = data?.stat_data;
+                    if (stat && typeof stat === 'object' && Object.keys(stat).length) {
+                        return { source: 'Mvu:' + options.type + (options.message_id !== undefined ? '(' + options.message_id + ')' : ''), data: stat };
+                    }
+                    tried.push('Mvu:' + options.type + ' 返回空');
+                } catch (error) {
+                    tried.push('Mvu:' + options.type + ' 抛错: ' + String(error?.message || error).slice(0, 60));
                 }
-            } catch { /* 试下一个 */ }
+            }
         }
-    } catch { /* ignore */ }
-    return null;
+    } catch (error) {
+        tried.push('Mvu 访问失败: ' + String(error?.message || error).slice(0, 60));
+    }
+
+    // 入口 2：酒馆助手 TavernHelper
+    try {
+        const helper = globalThis.TavernHelper;
+        if (helper && typeof helper.getVariables === 'function') {
+            const data = helper.getVariables({ type: 'chat' });
+            if (data && typeof data === 'object' && Object.keys(data).length) {
+                const stat = data.stat_data && typeof data.stat_data === 'object' ? data.stat_data : data;
+                if (Object.keys(stat).length) return { source: 'TavernHelper', data: stat };
+            }
+            tried.push('TavernHelper 返回空');
+        } else {
+            tried.push('TavernHelper: 未加载');
+        }
+    } catch (error) {
+        tried.push('TavernHelper 抛错: ' + String(error?.message || error).slice(0, 60));
+    }
+
+    // 入口 3：直接读聊天元数据
+    try {
+        const c = ctx();
+        const meta = c?.chatMetadata || {};
+        for (const key of ['variables', 'MVU', 'mvu', 'stat_data']) {
+            const value = meta[key];
+            if (!value || typeof value !== 'object') continue;
+            const stat = value.stat_data && typeof value.stat_data === 'object' ? value.stat_data : value;
+            if (Object.keys(stat).length) return { source: 'chatMetadata.' + key, data: stat };
+        }
+        tried.push('chatMetadata 里没有 variables/MVU');
+    } catch (error) {
+        tried.push('chatMetadata 读取失败');
+    }
+
+    return { error: '读不到 MVU 变量', tried };
 }
 
 /** 当前上下文摘要。 */
@@ -100,6 +164,27 @@ function snapshot() {
     const c = ctx();
     if (!c) return { ok: false, reason: '还没有连上酒馆' };
     const character = c.character || {};
+
+    // 世界书绑定：酒馆不同版本放在不同地方，逐个试
+    //   1. character.data.extensions.world（卡里声明）
+    //   2. character.extensions.world
+    //   3. chatMetadata.world_info（聊天级覆盖，可能是字符串或 {global/character/chat} 对象）
+    const worldNames = new Set();
+    const collect = value => {
+        if (!value) return;
+        if (typeof value === 'string') { if (value.trim()) worldNames.add(value.trim()); return; }
+        if (typeof value === 'object') {
+            for (const item of Object.values(value)) {
+                if (Array.isArray(item)) for (const name of item) { if (name) worldNames.add(String(name)); }
+                else if (typeof item === 'string' && item.trim()) worldNames.add(item.trim());
+            }
+        }
+    };
+    collect(character.data?.extensions?.world);
+    collect(character.extensions?.world);
+    collect(c.chatMetadata?.world_info);
+    collect(c.chatMetadata?.worldInfo);
+
     return {
         ok: true,
         at: Date.now(),
@@ -117,7 +202,7 @@ function snapshot() {
         character: {
             name: String(character.name || c.name2 || ''),
             avatar: String(character.avatar || ''),
-            world: String(character.data?.extensions?.world || ''),
+            world: [...worldNames].join('、'),
         },
         mvu: readMvu(),
         // 只报 key，不报内容（内容可能有密钥）
@@ -141,6 +226,57 @@ function recentMessages(limit = 30) {
         hidden: !!(msg?.is_system || msg?.is_hidden),
         at: Number(msg?.send_date) || 0,
     }));
+}
+
+/**
+ * 全局视图：所有角色卡 + 当前聊天之外的信息。
+ * 这是「看全局」的关键——不只是当前打开的那一张卡。
+ */
+function globalOverview() {
+    const c = ctx();
+    if (!c) return { ok: false, reason: '还没有连上酒馆' };
+    const characters = Array.isArray(c.characters) ? c.characters : [];
+    const groups = Array.isArray(c.groups) ? c.groups : [];
+    const currentName = String(c.name2 || c.character?.name || '');
+
+    return {
+        ok: true,
+        at: Date.now(),
+        current: currentName,
+        characters: characters
+            .filter(item => item && item.name && item.name !== '{{user}}')
+            .map(item => {
+                const data = item.data || item;
+                const book = data.character_book || data.data?.character_book;
+                const worldNames = new Set();
+                const collect = value => {
+                    if (!value) return;
+                    if (typeof value === 'string') { if (value.trim()) worldNames.add(value.trim()); return; }
+                };
+                collect(data.extensions?.world);
+                collect(item.extensions?.world);
+                return {
+                    name: String(item.name || ''),
+                    avatar: String(item.avatar || ''),
+                    isCurrent: String(item.name || '') === currentName,
+                    entries: Array.isArray(book?.entries) ? book.entries.length : 0,
+                    world: [...worldNames].join('、'),
+                    tags: Array.isArray(data.tags) ? data.tags.slice(0, 6) : [],
+                    creator: String(data.creator || ''),
+                    createDate: String(data.create_date || ''),
+                };
+            }),
+        groups: groups.map(item => ({
+            name: String(item.name || ''),
+            members: Array.isArray(item.members) ? item.members.length : 0,
+            id: String(item.id || ''),
+        })),
+        counts: {
+            characters: characters.filter(item => item && item.name && item.name !== '{{user}}').length,
+            groups: groups.length,
+            extensionSettings: Object.keys(c.extensionSettings || {}).length,
+        },
+    };
 }
 
 /* ------------------------------ 与中继通信 ------------------------------ */
@@ -221,11 +357,24 @@ async function handleJob(kind, args) {
     switch (kind) {
         case 'snapshot':
             return snapshot();
+        case 'global':
+            return globalOverview();
         case 'messages':
             return { messages: recentMessages(Number(args.limit) || 30) };
-        case 'mvu': {
-            const data = readMvu();
-            return data || { error: '没有 MVU 变量（没装 MVU 或这个聊天还没初始化）' };
+        case 'mvu':
+            return readMvu();
+        case 'switch_character': {
+            // 切换角色卡（按名字）。切完让中继那边稍等一下再取快照。
+            if (!settings.allowWrite) return { error: '写操作被关闭（在扩展设置里打开 allowWrite）' };
+            const name = String(args.name || '').trim();
+            if (!name) return { error: '缺少 name' };
+            const c = ctx();
+            const list = Array.isArray(c?.characters) ? c.characters : [];
+            const index = list.findIndex(item => String(item?.name || '') === name);
+            if (index < 0) return { error: '没有名为「' + name + '」的角色卡' };
+            if (typeof c.selectCharacterById !== 'function') return { error: '这个酒馆版本不支持 selectCharacterById' };
+            await c.selectCharacterById(index);
+            return { ok: true, switched: name };
         }
         case 'send_message': {
             // 往正文发一条用户消息（会触发 AI 回复）
